@@ -1,4 +1,4 @@
-import { AbiCoder, ethers, sha256 } from "ethers";
+import { AbiCoder, ethers, keccak256, sha256 } from "ethers";
 
 function parent(nodeIndex: number) {
     return Math.floor(nodeIndex / 2);
@@ -17,13 +17,9 @@ function sibling(nodeIndex: number) {
     return Number(BigInt(nodeIndex) ^ BigInt(1));
 }
 
-function hash(a: string, b: string) {
-    return sha256(new AbiCoder().encode(["bytes32", "bytes32"], [a, b])).toLowerCase();
-}
-
 
 export class IncMerkleTree {
-    // the depth of binary tree. max 63.
+    // the depth of binary tree. max 32.
     treeDepth: number;
     // leaf index: 0, 1, 2, ..., 2**(treeDepth-1)-1
     // node index:
@@ -43,20 +39,42 @@ export class IncMerkleTree {
     leafIndex2RootHash: Map<number, string>;
     rootHash2LeafIndex: Map<string, number>;
 
+    hashNodes: (a: string, b: string) => string
     zeroHashes: string[];
 
-    constructor(treeDepth: number) {
+    /**
+     * Create a new Incremental Merkle Tree
+     * @param treeDepth the depth of the binary tree, max 32
+     * @param hashFunction hash function for the merkle tree, sha256 or keccak256
+     */
+    constructor(treeDepth: number, hashFunction: string = "sha256") {
+        if (treeDepth < 1 || treeDepth > 32) {
+            throw Error(`invalid treeDepth ${treeDepth}, must be in [1, 32]`);
+        }
+        if (hashFunction === "sha256") {
+            this.hashNodes = (a: string, b: string) => {
+                return sha256(new AbiCoder().encode(["bytes32", "bytes32"], [a, b])).toLowerCase();
+            }
+        } else if (hashFunction === "keccak256") {
+            this.hashNodes = (a: string, b: string) => {
+                return keccak256(new AbiCoder().encode(["bytes32", "bytes32"], [a, b])).toLowerCase();
+            }
+        } else {
+            throw Error(`unsupported hashFunction ${hashFunction}`);
+        }
+
         this.treeDepth = treeDepth;
         this.zeroHashes = new Array(treeDepth);
         this.leafIndex2RootHash = new Map();
         this.rootHash2LeafIndex = new Map();
         this.nodeIndex2Hash = new Map();
         this.leafData = new Array();
+
         // initialize zero hashes at each height
         this.zeroHashes[0] = ethers.ZeroHash.toLowerCase();
         for (let height = 1; height < treeDepth; height++) {
             const childHash = this.zeroHashes[height - 1];
-            this.zeroHashes[height] = hash(childHash, childHash);
+            this.zeroHashes[height] = this.hashNodes(childHash, childHash);
         }
     }
 
@@ -70,6 +88,29 @@ export class IncMerkleTree {
 
     public getCurrentRootHash(): string {
         return this.getNodeHash(1);
+    }
+
+    public getRootHash(leafIndex: number): string {
+        if (leafIndex < 0 || leafIndex >= this.leafCount()) {
+            throw Error(`invalid leafIndex`);
+        }
+        return this.leafIndex2RootHash.get(leafIndex)!;
+    }
+
+    public getRootIndex(rootHash: string): number {
+        if (this.rootHash2LeafIndex.has(rootHash)) {
+            return this.rootHash2LeafIndex.get(rootHash)!;
+        }
+        return -1;
+    }
+
+    public getLeaf(leafIndex: number): [string, string] {
+        if (leafIndex < 0 || leafIndex >= this.leafCount()) {
+            throw Error(`invalid leafIndex`);
+        }
+        const leafHash = this.getNodeHash(this.leafIndex2NodeIndex(leafIndex));
+        const leafData = this.leafData[leafIndex];
+        return [leafHash, leafData];
     }
 
     // get current node hash
@@ -87,7 +128,13 @@ export class IncMerkleTree {
         return this.zeroHashes[height];
     }
 
-    async insertLeaf(leafIndex: number, leafData: string, leafHash: string) {
+    /**
+     * Insert new leaf into the tree
+     * @param leafIndex current leaf index
+     * @param leafData the data of leaf
+     * @param leafHash the hash of leaf node
+     */
+    public insertLeaf(leafIndex: number, leafHash: string, leafData: string) {
         // 1. check
         if (this.leafCount() === this.maxLeafCount()) {
             throw Error(`this tree is full`);
@@ -103,9 +150,9 @@ export class IncMerkleTree {
         for (let height = 1; height < this.treeDepth; height++) {
             // set hash of node at current heigh
             if ((currentIndex & 1) === 1) {
-                currHash = hash(this.getNodeHash(sibling(currentIndex)), currHash)
+                currHash = this.hashNodes(this.getNodeHash(sibling(currentIndex)), currHash)
             } else {
-                currHash = hash(currHash, this.getNodeHash(sibling(currentIndex)))
+                currHash = this.hashNodes(currHash, this.getNodeHash(sibling(currentIndex)))
             }
             currentIndex = parent(currentIndex);
             this.nodeIndex2Hash.set(currentIndex, currHash);
@@ -123,11 +170,13 @@ export class IncMerkleTree {
         return 2 ** (this.treeDepth - 1);
     }
 
-    // Prove the leaf at `proveLeafIndex` under the tree root at `targeLeafIndex`
-    // require `proveLeafIndex` <= `targeLeafIndex` < `this.leafCount()`
-    // return proof with `treeDepth` hashes. the first hash is the leaf hash. then followed by its
-    // sbilings at each height
-    getProof(proveLeafIndex: number, targeLeafIndex: number): string[] {
+    /**
+     * Prove the leaf at `proveLeafIndex` under the tree root at `targeLeafIndex`. Require `proveLeafIndex` <= `targeLeafIndex` <= `this.leafCount() - 1`
+     * @param proveLeafIndex the leaf index needed to prove
+     * @param targeLeafIndex target root index
+     * @returns proof with `treeDepth` hashes. the first hash is the leaf hash, then followed by its sbling at each height.
+     */
+    public getProof(proveLeafIndex: number, targeLeafIndex: number): string[] {
         if (proveLeafIndex > targeLeafIndex) {
             throw Error("targetLeafIndex > currentLeafIndex");
         }
@@ -170,10 +219,10 @@ export class IncMerkleTree {
             // get target node hash at current height
             if ((targetNodeIndex & 1) === 1) {
                 // right child
-                targetNodeHash = hash(this.getNodeHash(sibling(targetNodeIndex)), targetNodeHash);
+                targetNodeHash = this.hashNodes(this.getNodeHash(sibling(targetNodeIndex)), targetNodeHash);
             } else {
                 // left child
-                targetNodeHash = hash(targetNodeHash, this.zeroHashes[height - 1]);
+                targetNodeHash = this.hashNodes(targetNodeHash, this.zeroHashes[height - 1]);
             }
 
             proveNodeIndex = parent(proveNodeIndex);
@@ -182,18 +231,31 @@ export class IncMerkleTree {
         return proof;
     }
 
-    isValidProof(proveLeafIndex: number, targeLeafIndex: number, proof: string[]): boolean {
+    /**
+     * Verify if the proof is valid
+     * @param proveLeafIndex the leaf needed to prove
+     * @param targeLeafIndex target root index
+     * @param proof the first hash is the leaf hash, then followed by its sbling at each height.
+     * @returns true if proof is valid
+     */
+    public isValidProof(proveLeafIndex: number, targeLeafIndex: number, proof: string[]): boolean {
+        if (proof.length !== this.treeDepth) {
+            throw Error(`invalid proof length`);
+        }
         let proveNodeIndex = this.leafIndex2NodeIndex(proveLeafIndex);
         let currentHash = proof[0];
+        if (currentHash !== this.getNodeHash(proveNodeIndex)) {
+            return false;
+        }
         for (let height = 1; height < this.treeDepth; height++) {
             // compute hash at height
             const siblingHash = proof[height];
             if ((proveNodeIndex & 1) === 1) {
                 // right child
-                currentHash = hash(siblingHash, currentHash);
+                currentHash = this.hashNodes(siblingHash, currentHash);
             } else {
                 // left child
-                currentHash = hash(currentHash, siblingHash);
+                currentHash = this.hashNodes(currentHash, siblingHash);
             }
             proveNodeIndex = parent(proveNodeIndex);
         }
